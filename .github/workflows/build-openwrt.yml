@@ -1,0 +1,161 @@
+name: OpenWrt 智能编译
+
+# =============================================================================
+# 该工作流由 Web 工具后端通过 workflow_dispatch API 自动触发，
+# 也可在 GitHub Actions 页面手动触发（手动时只需选填源码/设备/插件参数，
+# 标准配置由工具生成；本文件保留完整 inputs 以便手动运行）。
+# =============================================================================
+on:
+  workflow_dispatch:
+    inputs:
+      build_id:
+        description: '工具侧任务 ID（同时作为 Artifact 名称 / Release tag）'
+        required: true
+        type: string
+      build_name:
+        description: '任务名称'
+        required: false
+        default: '手动构建'
+        type: string
+      source_repo:
+        description: '上游源码仓库地址'
+        required: true
+        type: string
+      source_branch:
+        description: '上游分支'
+        required: true
+        type: string
+      target:
+        description: '目标架构，如 x86 / bcm27xx / ramips / rockchip'
+        required: true
+        type: string
+      subtarget:
+        description: '子目标，如 64 / bcm2711 / mt7621 / armv8'
+        required: true
+        type: string
+      profile:
+        description: '设备 PROFILE，如 generic / rpi-4'
+        required: false
+        default: 'generic'
+        type: string
+      plugins:
+        description: '插件 ID 列表（逗号分隔，仅记录）'
+        required: false
+        default: ''
+        type: string
+      feeds_conf_b64:
+        description: 'base64 编码的 feeds.conf.default'
+        required: false
+        default: ''
+        type: string
+      config_text_b64:
+        description: 'base64 编码的 .config 种子配置'
+        required: true
+        type: string
+      publish_release:
+        description: '编译成功后是否发布到 Releases'
+        required: false
+        default: false
+        type: boolean
+
+env:
+  TZ: Asia/Shanghai
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: 拉取源码并编译固件
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+
+    steps:
+      - name: 检出工具仓库（含构建脚本）
+        uses: actions/checkout@v4
+
+      - name: 释放磁盘空间
+        run: |
+          echo "编译前磁盘空间："
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc 2>/dev/null || true
+          sudo docker rmi $(sudo docker images -q) 2>/dev/null || true
+          echo "清理后磁盘空间："
+          df -h /
+
+      - name: 安装编译依赖
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            build-essential clang flex bison g++ gawk gcc-multilib g++-multilib \
+            gettext git libncurses-dev libssl-dev python3-distutils rsync unzip \
+            zlib1g-dev file wget xsltproc libelf-dev ecj java-propose-classpath \
+            autoconf automake libtool pkg-config ccache device-tree-compiler \
+            squashfs-tools
+
+      - name: 打印构建参数
+        run: |
+          echo "build_id       : ${{ inputs.build_id }}"
+          echo "build_name     : ${{ inputs.build_name }}"
+          echo "source_repo    : ${{ inputs.source_repo }}"
+          echo "source_branch  : ${{ inputs.source_branch }}"
+          echo "target         : ${{ inputs.target }}/${{ inputs.subtarget }}"
+          echo "profile        : ${{ inputs.profile }}"
+          echo "plugins        : ${{ inputs.plugins }}"
+          echo "publish_release: ${{ inputs.publish_release }}"
+
+      - name: 执行云端构建脚本
+        env:
+          BUILD_ID: ${{ inputs.build_id }}
+          BUILD_NAME: ${{ inputs.build_name }}
+          SOURCE_REPO: ${{ inputs.source_repo }}
+          SOURCE_BRANCH: ${{ inputs.source_branch }}
+          TARGET: ${{ inputs.target }}
+          SUBTARGET: ${{ inputs.subtarget }}
+          PROFILE: ${{ inputs.profile }}
+          PLUGINS: ${{ inputs.plugins }}
+          FEEDS_B64: ${{ inputs.feeds_conf_b64 }}
+          CONFIG_B64: ${{ inputs.config_text_b64 }}
+        run: |
+          chmod +x build-scripts/openwrt-build.sh
+          ./build-scripts/openwrt-build.sh
+
+      - name: 上传固件 Artifact
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.build_id }}
+          path: firmware/
+          retention-days: 7
+          if-no-files-found: error
+
+      - name: 发布到 GitHub Releases
+        if: success() && inputs.publish_release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.build_id }}
+          name: 'OpenWrt 固件 - ${{ inputs.build_name }}'
+          files: firmware/*
+          body: |
+            ## 构建信息
+            - 任务 ID：`${{ inputs.build_id }}`
+            - 任务名称：${{ inputs.build_name }}
+            - 源码：${{ inputs.source_repo }}（分支 `${{ inputs.source_branch }}`）
+            - 目标：`${{ inputs.target }}/${{ inputs.subtarget }}`（PROFILE `${{ inputs.profile }}`）
+            - 插件：${{ inputs.plugins }}
+
+            下载后请使用同目录 `sha256sums.txt` 校验文件完整性。
+            默认登录地址 http://192.168.1.1 （x86 默认 root 无密码，分支差异以其文档为准）。
+            刷机有风险，请确认设备型号后操作。
+
+      - name: 上传失败诊断信息
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diagnose-${{ inputs.build_id }}
+          path: |
+            build.log
+            seed.config
+            final.config
+          retention-days: 14
+          if-no-files-found: ignore
