@@ -44,7 +44,7 @@ on:
         default: ''
         type: string
       feeds_conf_b64:
-        description: 'base64 编码的 feeds.conf.default'
+        description: 'base64 编码的额外 feeds（追加到源码自带 feeds.conf.default）'
         required: false
         default: ''
         type: string
