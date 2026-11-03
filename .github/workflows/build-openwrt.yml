@@ -1,3 +1,4 @@
+# openwrt-builder-workflow-rev: 2026-11-03.1
 name: OpenWrt 智能编译
 
 # =============================================================================
@@ -51,6 +52,11 @@ on:
       config_text_b64:
         description: 'base64 编码的 .config 种子配置'
         required: true
+        type: string
+      files_json_b64:
+        description: 'base64 编码的固件预置文件 JSON（旁路由专用固件的 uci-defaults）'
+        required: false
+        default: ''
         type: string
       publish_release:
         description: '编译成功后是否发布到 Releases'
@@ -119,6 +125,7 @@ jobs:
           PLUGINS: ${{ inputs.plugins }}
           FEEDS_B64: ${{ inputs.feeds_conf_b64 }}
           CONFIG_B64: ${{ inputs.config_text_b64 }}
+          FILES_JSON_B64: ${{ inputs.files_json_b64 }}
         run: |
           chmod +x build-scripts/openwrt-build.sh
           ./build-scripts/openwrt-build.sh
@@ -148,7 +155,8 @@ jobs:
             - 插件：${{ inputs.plugins }}
 
             下载后请使用同目录 `sha256sums.txt` 校验文件完整性。
-            默认登录地址 http://192.168.1.1 （x86 默认 root 无密码，分支差异以其文档为准）。
+            旁路由专用固件已在首次开机时写入 LAN 静态地址、主路由网关/DNS 并关闭 DHCP，
+            具体地址见固件内 `/root/BYPASS_README.txt`。
             刷机有风险，请确认设备型号后操作。
 
       - name: 上传失败诊断信息
