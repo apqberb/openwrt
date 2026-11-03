@@ -1,5 +1,5 @@
 #!/bin/bash
-# openwrt-builder-script-rev: 2026-11-03.1
+# openwrt-builder-script-rev: 2026-11-03.2
 # =============================================================================
 # OpenWrt 智能编译工具 - 云端构建脚本（在 GitHub Actions Runner 中执行）
 #
@@ -208,6 +208,16 @@ if [ "$UPX_FIX_COUNT" -gt 0 ]; then
   echo "预编译 host upx（UPX --best 压缩较慢，但只需构建一次）"
   make package/feeds/packages/upx/host/compile -j1 || echo "::warning::host upx 预编译失败，依赖 UPX 的插件可能编译失败"
 fi
+# github.com 的源码归档是按仓库内容动态生成的，会随 .gitattributes 规则变化，
+# mihomo 官方写死的 PKG_MIRROR_HASH 已经对不上，会报
+# “Wrong hash (probably caused by .gitattributes)” 然后回退 git clone；
+# 国内直连 github.com 又经常被重置，最后变成 mihomo failed to build。
+# 该包源码本就来自 GitHub 官方仓库，这里放宽归档哈希校验，避免编译卡在下载阶段。
+MIHOMO_MF=feeds/helloworld/mihomo/Makefile
+if [ -f "$MIHOMO_MF" ]; then
+  sed -i 's#^PKG_MIRROR_HASH:=.*#PKG_MIRROR_HASH:=skip#' "$MIHOMO_MF"
+  echo "已放宽 mihomo 源码包哈希校验（GitHub 归档哈希会变动）"
+fi
 echo "::endgroup::"
 
 echo "::group::5/7 下载源码依赖包"
@@ -217,6 +227,15 @@ find dl -size -1024c -exec rm -f {} \; 2>/dev/null || true
 echo "::endgroup::"
 
 echo "::group::6/7 编译固件"
+# Go 插件（clashoo / mihomo 等）编译时要联网拉取 Go 模块，直连 proxy.golang.org
+# 容易超时，报 “dial tcp ... i/o timeout”，最后变成 “no Go files in .go_work/build”。
+# OpenWrt 的 golang 包不会重置 GOPROXY，这里检测国内镜像可达后切换。
+if timeout 8 bash -c 'exec 3<>/dev/tcp/goproxy.cn/443' 2>/dev/null; then
+  export GOPROXY="https://goproxy.cn,direct"
+  echo "Go 模块代理已切换为 goproxy.cn（避免 proxy.golang.org 超时）"
+else
+  echo "无法访问 goproxy.cn，Go 模块继续使用默认代理"
+fi
 set +e
 make -j"$(nproc)" 2>&1 | tee "$LOG_FILE"
 RC=${PIPESTATUS[0]}
