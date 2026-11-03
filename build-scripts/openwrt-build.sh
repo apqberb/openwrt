@@ -1,4 +1,5 @@
 #!/bin/bash
+# openwrt-builder-script-rev: 2026-11-03.1
 # =============================================================================
 # OpenWrt 智能编译工具 - 云端构建脚本（在 GitHub Actions Runner 中执行）
 #
@@ -11,6 +12,7 @@
 #   PLUGINS         逗号分隔的插件 id（仅用于记录）
 #   FEEDS_B64       base64 编码的额外 feeds（追加到源码自带 feeds.conf.default）
 #   CONFIG_B64      base64 编码的 .config 种子文件
+#   FILES_JSON_B64  base64 编码的固件预置文件 JSON（旁路由的 uci-defaults 等）
 #   BUILD_ID        工具侧任务 id（同时作为 Artifact 名称与 Release tag）
 #   BUILD_NAME      任务名称
 #
@@ -95,7 +97,48 @@ echo "::group::3/7 更新并安装 feeds"
 ./scripts/feeds install -a
 echo "::endgroup::"
 
-echo "::group::4/7 写入 .config 并执行 defconfig"
+echo "::group::4/7 写入固件预置文件与 .config"
+# 固件预置文件：旁路由专用固件把 LAN 静态地址、网关/DNS、关闭 DHCP
+# 写进 files/etc/uci-defaults，首次开机自动生效。这里必须解包到源码根目录，
+# 只传 .config 是做不到“刷完机就是旁路由”的。
+PRESET_FILE_COUNT=0
+if [ -n "${FILES_JSON_B64:-}" ]; then
+  echo "$FILES_JSON_B64" | base64 -d > "$WORKDIR/preset-files.json"
+  python3 - "$WORKDIR/preset-files.json" "$BUILD_DIR" <<'PY'
+import json
+import os
+import sys
+
+manifest, build_dir = sys.argv[1], sys.argv[2]
+with open(manifest, encoding='utf-8') as fh:
+    files = json.load(fh)
+if not isinstance(files, list):
+    raise SystemExit('preset files manifest must be a JSON array')
+
+root = os.path.realpath(build_dir)
+for item in files:
+    rel = str(item.get('path') or '').strip().replace('\\', '/')
+    if not rel.startswith('files/'):
+        raise SystemExit(f'invalid preset path: {rel}')
+    dest = os.path.realpath(os.path.join(build_dir, rel))
+    if os.path.commonpath([root, dest]) != root:
+        raise SystemExit(f'preset path escapes build dir: {rel}')
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    with open(dest, 'w', encoding='utf-8', newline='\n') as fh:
+        fh.write(str(item.get('content') or ''))
+    mode = str(item.get('mode') or '0644')
+    try:
+        os.chmod(dest, int(mode, 8))
+    except ValueError:
+        os.chmod(dest, 0o644)
+    print(f'  + {rel} ({mode})')
+PY
+  rm -f "$WORKDIR/preset-files.json"
+  PRESET_FILE_COUNT=$(find "$BUILD_DIR/files" -type f 2>/dev/null | wc -l || true)
+  echo "已写入 $PRESET_FILE_COUNT 个固件预置文件"
+else
+  echo "未提供固件预置文件（主路由固件）"
+fi
 echo "$CONFIG_B64" | base64 -d > .config
 # 老版 LuCI（如 Lienol 23.05）把 Lua 运行时内置在 luci-base 中，没有独立的
 # luci-lua-runtime 包。新插件（如 luci-app-wechatpush）依赖它时，补一个空兼容包，
@@ -145,6 +188,26 @@ make defconfig
 cp .config "$WORKDIR/final.config"
 echo "--- 最终 .config 中选中的 luci 包（节选） ---"
 grep -E '^CONFIG_PACKAGE_luci' .config | head -80 || true
+SELECTED_PKG_COUNT=$(grep -c '^CONFIG_PACKAGE_.*=y' .config 2>/dev/null || true)
+if grep -q '^CONFIG_ALL=y' .config 2>/dev/null; then
+  echo "::warning::.config 含 CONFIG_ALL=y（全选），将下载并编译整个 feeds（实测 5.6GB、仅下载就 5 小时以上）"
+else
+  echo "按需下载：只下载 .config 中已选中的 ${SELECTED_PKG_COUNT:-0} 个软件包源码，未选中的包不会下载"
+fi
+
+# 24.10 的 host 包安装在 staging_dir/hostpkg，但 helloworld/mihomo 等第三方包仍写死
+# $(STAGING_DIR_HOST)/bin/upx，会报 “host/bin/upx: No such file or directory”。
+# 统一修正路径并提前构建 host upx，避免云端也在同一步失败。
+UPX_FIX_COUNT=0
+while IFS= read -r mf; do
+  sed -i 's#STAGING_DIR_HOST)/bin/upx#STAGING_DIR_HOSTPKG)/bin/upx#g' "$mf"
+  echo "已修正 UPX host 路径：$mf"
+  UPX_FIX_COUNT=$((UPX_FIX_COUNT+1))
+done < <(grep -rl 'STAGING_DIR_HOST)/bin/upx' feeds package 2>/dev/null || true)
+if [ "$UPX_FIX_COUNT" -gt 0 ]; then
+  echo "预编译 host upx（UPX --best 压缩较慢，但只需构建一次）"
+  make package/feeds/packages/upx/host/compile -j1 || echo "::warning::host upx 预编译失败，依赖 UPX 的插件可能编译失败"
+fi
 echo "::endgroup::"
 
 echo "::group::5/7 下载源码依赖包"
@@ -203,6 +266,7 @@ cat > build-info.json <<EOF
   "subtarget": "$SUBTARGET",
   "profile": "$PROFILE",
   "plugins": "$PLUGINS",
+  "preset_files": ${PRESET_FILE_COUNT:-0},
   "built_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 }
 EOF
